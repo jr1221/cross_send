@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:file_saver/file_saver.dart';
 import 'package:flutter_barcode_scanner/flutter_barcode_scanner.dart';
 import 'package:image_gallery_saver/image_gallery_saver.dart';
 import 'package:network_info_plus/network_info_plus.dart';
@@ -15,6 +16,8 @@ import 'package:flutter/material.dart';
 
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:path/path.dart';
+
+import 'package:logging/logging.dart';
 
 void main() {
   HttpOverrides.global = CertOverride();
@@ -38,73 +41,72 @@ class Home extends StatefulWidget {
 }
 
 class _HomeState extends State<Home> {
+  int counter = 0;
+  int thirdCount = 0;
+  int numOfFiles = 1;
+
+  final List<String> listOfImageCodecs = [
+    '.mp4',
+    '.mkv',
+    '.webm',
+    '.bmp',
+    '.gif',
+    '.jpg',
+    '.png',
+    '.webp',
+    '.heic',
+    '.heif'
+  ];
+
   Future<dynamic> _runJag() async {
+    counter = 0;
+    thirdCount = 0;
     FilePickerResult? pickResult =
         await FilePicker.platform.pickFiles(allowMultiple: true);
     if (pickResult == null) return 'Nothing chosen';
     String pickPath;
-    String qrData;
-
     await RunServe.createServer();
-
-    if (pickResult.isSinglePick) {
-      try {
-        pickPath = pickResult.files.single.path!;
-      } catch (e) {
-        return 'File not found \n $e';
-      }
-      qrData = await RunServe.startServer(pickPath);
-    } else {
-      try {
-        print(pickResult.paths.first);
-        pickPath = pickResult.paths.first!
-            .substring(0, pickResult.paths.first!.lastIndexOf('/') + 1);
-        print(pickPath);
-      } catch (e) {
-        return 'Files not found \n $e';
-      }
-
-      List<String> copied = List.empty(growable: true);
-      pickResult.paths.forEach((element) {
-        if (element != null)
-          copied.add(element);
-        else
-          return;
-      });
-      qrData = await RunServe.startServer(pickPath,
-          multiple: true, uploadFilesList: copied);
+    try {
+      pickPath = pickResult.paths.first!
+          .substring(0, pickResult.paths.first!.lastIndexOf('/') + 1);
+    } catch (e) {
+      return 'File (s) not found \n $e';
     }
-
+    List<SendImage> copied = List.empty(growable: true);
+    pickResult.paths.forEach((element) {
+      if (element != null) {
+        bool isImg = false;
+        listOfImageCodecs.forEach((imgExt) {
+          if (extension(element) == imgExt) isImg = true;
+        });
+        copied.add(SendImage(basename(element), isImg));
+      } else
+        return;
+    });
+    numOfFiles = copied.length;
+    final SendPack sendObj = await RunServe.startServer(pickPath, copied);
     return QrImage(
-      data: qrData,
+      data: jsonEncode(sendObj),
     );
   }
 
-  Future<void> _runRec() async {
-    final barcodeResult = await FlutterBarcodeScanner.scanBarcode(
-        "#000000", "Cancel", true, ScanMode.QR);
-    if (!barcodeResult.startsWith(r'+')) {
-      final savePath =
-          '${(await getTemporaryDirectory()).path}/${barcodeResult.substring(barcodeResult.lastIndexOf('/'))}';
-      await Dio().download(barcodeResult, savePath);
-      await ImageGallerySaver.saveFile(savePath);
-    } else {
-      String baseUrl = barcodeResult.substring(1, barcodeResult.indexOf('*'));
-      print(baseUrl);
-      String basePath = (await getTemporaryDirectory()).path + '/';
-      List<String> listOfItems =
-          barcodeResult.substring(barcodeResult.indexOf('*') + 1).split(r'?');
-      for (String s in listOfItems) {
-        print(s);
-      }
-      listOfItems.removeLast();
-      for (String req in listOfItems) {
-        String savePath = basePath + req;
-        print(savePath);
-        print(baseUrl + req);
-        await Dio().download(baseUrl + req, savePath);
+  Future<dynamic> _runRec() async {
+    final barcodeResultObj = SendPack.fromJson(jsonDecode(
+        await FlutterBarcodeScanner.scanBarcode(
+            "#000000", "Cancel", true, ScanMode.QR)));
+    String baseUrl =
+        'https://${barcodeResultObj.ip}:${barcodeResultObj.port}/${barcodeResultObj.sendDir}/';
+    String basePath = (await getTemporaryDirectory()).path + '/';
+    for (SendImage imgObj in barcodeResultObj.imageList) {
+      String savePath = basePath + imgObj.imgName;
+      await Dio().download(baseUrl + imgObj.imgName, savePath);
+      if (imgObj.isImg)
         await ImageGallerySaver.saveFile(savePath);
-      }
+      else
+        await FileSaver.instance.saveFile(
+            basename(imgObj.imgName),
+            await File(savePath).readAsBytes(),
+            extension(imgObj.imgName).substring(1));
     }
   }
 
@@ -135,6 +137,19 @@ class _HomeState extends State<Home> {
                                   Text(
                                       r'Click "Scan Code to Recieve" on the other device, and scan the below QR code'),
                                   runJagResponse,
+                                  StreamBuilder<LogRecord>(
+                                      stream: RunServe.server.log.onRecord,
+                                      builder: (context, orderSnapshot) {
+                                        if (!orderSnapshot.hasData) {
+                                          return Text("Waiting...");
+                                        } else {
+                                          thirdCount++;
+                                          if (thirdCount % numOfFiles == 0)
+                                            counter++;
+                                          return Text(
+                                              "There have been $counter downloads");
+                                        }
+                                      }),
                                 ],
                               ));
                     } else
@@ -150,8 +165,17 @@ class _HomeState extends State<Home> {
                   }),
               ElevatedButton(
                   child: Text("Scan Code to Receive"),
-                  onPressed: () {
-                    _runRec();
+                  onPressed: () async {
+                    final runRecResponse = await _runRec();
+                    if (runRecResponse != null)
+                      showDialog(
+                          context: context,
+                          builder: (_) => SimpleDialog(
+                                title: Text('Error!'),
+                                children: [
+                                  Text(runRecResponse.toString()),
+                                ],
+                              ));
                   }),
             ],
           ),
@@ -174,26 +198,50 @@ class RunServe {
     server = Jaguar(port: 8080, securityContext: security);
   }
 
-  static Future<String> startServer(String uploadFileRef,
-      {bool multiple = false, List<String>? uploadFilesList}) async {
-    if (multiple) {
-      print('zz' + uploadFileRef);
-      server.staticFiles('dirSend/*', uploadFileRef);
-    } else {
-      server.staticFile('/${basename(uploadFileRef)}', uploadFileRef);
-    }
-    await server.serve();
+  static Future<SendPack> startServer(
+      String uploadFileRef, List<SendImage> uploadFilesList) async {
+    server.staticFiles('dirSend/*', uploadFileRef);
+    await server.serve(logRequests: true);
     final String ip = (await (NetworkInfo().getWifiIP()))!;
-    String url;
-    if (multiple) {
-      url = '+https://$ip:8080/dirSend/*';
-      for (String pathOf in uploadFilesList!) {
-        url += basename(pathOf) + '?';
-      }
-      return url;
-    } else {
-      url = 'https://$ip:8080/${basename(uploadFileRef)}';
-    }
-    return url;
+    SendPack sender = SendPack(ip, '8080', 'dirSend', uploadFilesList);
+    return sender;
   }
+}
+
+class SendPack {
+  String ip; // ip
+  String port; // port
+  String sendDir; // sendDir
+
+  List<SendImage> imageList; // upload file list
+
+  SendPack(this.ip, this.port, this.sendDir, this.imageList);
+
+  SendPack.fromJson(Map<String, dynamic> json)
+      : ip = json['i'],
+        port = json['p'],
+        sendDir = json['d'],
+        imageList = (json['l'] as List)
+            .map((element) => SendImage.fromJson(element))
+            .toList();
+
+  Map<String, dynamic> toJson() => {
+        r'i': ip,
+        r'p': port,
+        r'd': sendDir,
+        r'l': this.imageList.map((ab) => ab.toJson()).toList(),
+      };
+}
+
+class SendImage {
+  String imgName; // name of image
+  bool isImg; // is image or video (media) or not, for location to store
+
+  SendImage(this.imgName, this.isImg);
+
+  SendImage.fromJson(Map<String, dynamic> json)
+      : imgName = json['n'],
+        isImg = json['m'];
+
+  Map<String, dynamic> toJson() => {r'n': imgName, r'm': isImg};
 }
