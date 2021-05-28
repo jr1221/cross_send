@@ -2,14 +2,15 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:dio/adapter.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:file_saver/file_saver.dart';
 import 'package:flutter_barcode_scanner/flutter_barcode_scanner.dart';
 import 'package:image_gallery_saver/image_gallery_saver.dart';
+import 'package:jaguar/serve/server.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:dio/dio.dart';
 import 'package:path_provider/path_provider.dart';
-import 'package:jaguar/serve/server.dart';
 import 'package:qr_flutter/qr_flutter.dart';
 
 import 'package:flutter/material.dart';
@@ -19,20 +20,12 @@ import 'package:path/path.dart';
 
 import 'package:logging/logging.dart';
 
+import 'constants.dart';
+
 void main() {
-  HttpOverrides.global = CertOverride();
   runApp(MaterialApp(
     home: Home(),
   ));
-}
-
-class CertOverride extends HttpOverrides {
-  @override
-  HttpClient createHttpClient(SecurityContext? context) {
-    return super.createHttpClient(context)
-      ..badCertificateCallback =
-          (X509Certificate cert, String host, int port) => true;
-  }
 }
 
 class Home extends StatefulWidget {
@@ -45,18 +38,7 @@ class _HomeState extends State<Home> {
   int thirdCount = 0;
   int numOfFiles = 1;
 
-  final List<String> listOfImageCodecs = [
-    '.mp4',
-    '.mkv',
-    '.webm',
-    '.bmp',
-    '.gif',
-    '.jpg',
-    '.png',
-    '.webp',
-    '.heic',
-    '.heif'
-  ];
+  Dio dio = Dio();
 
   Future<dynamic> _runJag() async {
     counter = 0;
@@ -76,9 +58,12 @@ class _HomeState extends State<Home> {
     pickResult.paths.forEach((element) {
       if (element != null) {
         bool isImg = false;
-        listOfImageCodecs.forEach((imgExt) {
-          if (extension(element) == imgExt) isImg = true;
-        });
+        for (String imgExt in Constants.listOfImageCodecs) {
+          if (extension(element) == imgExt) {
+            isImg = true;
+            break;
+          }
+        }
         copied.add(SendImage(basename(element), isImg));
       } else
         return;
@@ -99,7 +84,7 @@ class _HomeState extends State<Home> {
     String basePath = (await getTemporaryDirectory()).path + '/';
     for (SendImage imgObj in barcodeResultObj.imageList) {
       String savePath = basePath + imgObj.imgName;
-      await Dio().download(baseUrl + imgObj.imgName, savePath);
+      await dio.download(baseUrl + imgObj.imgName, savePath);
       if (imgObj.isImg)
         await ImageGallerySaver.saveFile(savePath);
       else
@@ -108,6 +93,27 @@ class _HomeState extends State<Home> {
             await File(savePath).readAsBytes(),
             extension(imgObj.imgName).substring(1));
     }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _configDio();
+  }
+
+  Future<void> _configDio() async {
+    String certAsset = await rootBundle.loadString(Constants.certPath);
+
+    (dio.httpClientAdapter as DefaultHttpClientAdapter).onHttpClientCreate =
+        (client) {
+      client.badCertificateCallback =
+          (X509Certificate cert, String host, int port) {
+        if (cert.pem == certAsset) {
+          return true;
+        }
+        return false;
+      };
+    };
   }
 
   @override
@@ -123,7 +129,7 @@ class _HomeState extends State<Home> {
           child: ListView(
             children: [
               ElevatedButton(
-                  child: Text("Start Sender"),
+                  child: Text("Send Files!"),
                   onPressed: () async {
                     final runJagResponse = await _runJag();
 
@@ -141,7 +147,7 @@ class _HomeState extends State<Home> {
                                       stream: RunServe.server.log.onRecord,
                                       builder: (context, orderSnapshot) {
                                         if (!orderSnapshot.hasData) {
-                                          return Text("Waiting...");
+                                          return Text("No Downloads Yet...");
                                         } else {
                                           thirdCount++;
                                           if (thirdCount % numOfFiles == 0)
@@ -164,7 +170,7 @@ class _HomeState extends State<Home> {
                       );
                   }),
               ElevatedButton(
-                  child: Text("Scan Code to Receive"),
+                  child: Text("Recieve Files"),
                   onPressed: () async {
                     final runRecResponse = await _runRec();
                     if (runRecResponse != null)
@@ -192,18 +198,22 @@ class RunServe {
     await server.close();
     final security = SecurityContext();
     security.useCertificateChainBytes(
-        (utf8.encode(await rootBundle.loadString('ssl/cert1.pem'))));
+        (utf8.encode(await rootBundle.loadString(Constants.certPath))));
     security.usePrivateKeyBytes(
-        (utf8.encode(await rootBundle.loadString('ssl/privkey1.pem'))));
+        (utf8.encode(await rootBundle.loadString(Constants.privkeyPath))));
     server = Jaguar(port: 8080, securityContext: security);
   }
 
   static Future<SendPack> startServer(
       String uploadFileRef, List<SendImage> uploadFilesList) async {
-    server.staticFiles('dirSend/*', uploadFileRef);
+    server.staticFiles(
+      '${Constants.sendDir}/*',
+      uploadFileRef,
+    );
     await server.serve(logRequests: true);
     final String ip = (await (NetworkInfo().getWifiIP()))!;
-    SendPack sender = SendPack(ip, '8080', 'dirSend', uploadFilesList);
+    SendPack sender = SendPack(
+        ip, Constants.sendPort.toString(), Constants.sendDir, uploadFilesList);
     return sender;
   }
 }
